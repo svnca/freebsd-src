@@ -383,6 +383,58 @@ static void vnet_wg_uninit(const void *);
 static int wg_module_init(void);
 static void wg_module_deinit(void);
 
+struct wg_ratelimit {
+	struct timeval lasttime;
+	int counter;
+};
+
+static inline bool
+ratelimited(struct wg_ratelimit *rl, int pps)
+{
+	return (ppsratecheck(&rl->lasttime, &rl->counter, pps));
+}
+
+#define	pr_ratelimit(pps) ({				\
+	static struct wg_ratelimit __ratelimited;	\
+	ratelimited(&__ratelimited, pps);		\
+})
+
+#define	prlim(pps, ...) ({				\
+	bool __retval = pr_ratelimit(pps);		\
+	if (__retval)					\
+		printf(__VA_ARGS__);			\
+	__retval;					\
+})
+
+static void
+mb_hexdump(const struct mbuf *m)
+{
+	while (m) {
+		hexdump(mtod(m, void *), m->m_len, NULL, 0);
+		m = m->m_next;
+	}
+}
+
+#define PTR_ENCODE_BITS 3UL
+
+static inline void *
+ptr_encode(const void *m, unsigned long flags)
+{
+	return (void *)((flags & PTR_ENCODE_BITS) | (unsigned long)m);
+}
+
+static inline void *
+ptr_decode(const void *m)
+{
+	return (void *)(~PTR_ENCODE_BITS & (unsigned long)m);
+}
+
+static inline unsigned long
+ptr_flags(const void *m)
+{
+	return PTR_ENCODE_BITS & (unsigned long)m;
+}
+
 /* TODO Peer */
 static struct wg_peer *
 wg_peer_alloc(struct wg_softc *sc, const uint8_t pub_key[WG_KEY_SIZE])
@@ -1685,6 +1737,7 @@ wg_deliver_in(struct wg_peer *peer)
 	struct wg_packet	*pkt;
 	struct mbuf		*m;
 	struct epoch_tracker	 et;
+	static int count;
 
 	while ((pkt = wg_queue_dequeue_serial(&peer->p_decrypt_serial)) != NULL) {
 		if (pkt->p_state != WG_PACKET_CRYPTED)
@@ -1720,8 +1773,13 @@ wg_deliver_in(struct wg_peer *peer)
 
 		CURVNET_SET(ifp->if_vnet);
 		M_SETFIB(m, ifp->if_fib);
-		if (pkt->p_af == AF_INET)
+		if (pkt->p_af == AF_INET) {
+			if (0 && pr_ratelimit(-1)) {
+				printf("wg: netisr dispatch: %d\n", count++);
+				mb_hexdump(m);
+			}
 			netisr_dispatch(NETISR_IP, m);
+		}
 		if (pkt->p_af == AF_INET6)
 			netisr_dispatch(NETISR_IPV6, m);
 		CURVNET_RESTORE();
