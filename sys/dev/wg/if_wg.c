@@ -9,6 +9,7 @@
 
 #include "opt_inet.h"
 #include "opt_inet6.h"
+#include "opt_stack.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -28,6 +29,7 @@
 #include <sys/rwlock.h>
 #include <sys/smp.h>
 #include <sys/socket.h>
+#include <sys/stack.h>
 #include <sys/socketvar.h>
 #include <sys/sockio.h>
 #include <sys/sysctl.h>
@@ -51,6 +53,13 @@
 #include <netinet/udp.h>
 #include <netinet/udp_var.h>
 #include <netinet6/nd6.h>
+
+#ifdef DEV_NETMAP
+#undef ni_flags
+#include <sys/bus_dma.h>
+#include <net/netmap.h>
+#include <dev/netmap/netmap_kern.h>
+#endif
 
 #include "wg_noise.h"
 #include "wg_cookie.h"
@@ -366,6 +375,7 @@ static int wg_clone_create(struct if_clone *ifc, char *name, size_t len,
 static void wg_qflush(struct ifnet *);
 static inline int determine_af_and_pullup(struct mbuf **m, sa_family_t *af);
 static int wg_xmit(struct ifnet *, struct mbuf *, sa_family_t, uint32_t);
+static void wg_if_input(struct ifnet *ifp, struct mbuf *m);
 static int wg_transmit(struct ifnet *, struct mbuf *);
 static int wg_output(struct ifnet *, struct mbuf *, const struct sockaddr *, struct route *);
 static int wg_clone_destroy(struct if_clone *ifc, struct ifnet *ifp,
@@ -433,6 +443,18 @@ static inline unsigned long
 ptr_flags(const void *m)
 {
 	return PTR_ENCODE_BITS & (unsigned long)m;
+}
+
+static void
+dump_stack(void)
+{
+#ifdef STACK
+	struct stack st;
+
+	stack_zero(&st);
+	stack_save(&st);
+	stack_print(&st);
+#endif
 }
 
 /* TODO Peer */
@@ -1729,6 +1751,31 @@ error:
 	}
 }
 
+enum {
+	BITS_AF_INET	= 1UL,
+	BITS_AF_INET6	= 2UL
+};
+
+static inline unsigned long
+af_to_bits(sa_family_t af)
+{
+	if (af == AF_INET)
+		return BITS_AF_INET;
+	if (af == AF_INET6)
+		return BITS_AF_INET6;
+	return 0;
+}
+
+static inline sa_family_t
+bits_to_af(unsigned long af)
+{
+	if (af == BITS_AF_INET)
+		return AF_INET;
+	if (af == BITS_AF_INET6)
+		return AF_INET6;
+	return 0;
+}
+
 static void
 wg_deliver_in(struct wg_peer *peer)
 {
@@ -1736,8 +1783,6 @@ wg_deliver_in(struct wg_peer *peer)
 	struct ifnet		*ifp = sc->sc_ifp;
 	struct wg_packet	*pkt;
 	struct mbuf		*m;
-	struct epoch_tracker	 et;
-	static int count;
 
 	while ((pkt = wg_queue_dequeue_serial(&peer->p_decrypt_serial)) != NULL) {
 		if (pkt->p_state != WG_PACKET_CRYPTED)
@@ -1766,24 +1811,10 @@ wg_deliver_in(struct wg_peer *peer)
 		MPASS(pkt->p_af == AF_INET || pkt->p_af == AF_INET6);
 		pkt->p_mbuf = NULL;
 
-		m->m_pkthdr.rcvif = ifp;
-
-		NET_EPOCH_ENTER(et);
-		BPF_MTAP2_AF(ifp, m, pkt->p_af);
-
-		CURVNET_SET(ifp->if_vnet);
-		M_SETFIB(m, ifp->if_fib);
-		if (pkt->p_af == AF_INET) {
-			if (0 && pr_ratelimit(-1)) {
-				printf("wg: netisr dispatch: %d\n", count++);
-				mb_hexdump(m);
-			}
-			netisr_dispatch(NETISR_IP, m);
-		}
-		if (pkt->p_af == AF_INET6)
-			netisr_dispatch(NETISR_IPV6, m);
-		CURVNET_RESTORE();
-		NET_EPOCH_EXIT(et);
+		/* wg_if_input(ifp, ptr_encode(m, af_to_bits(pkt->p_af))); */
+		/* (*ifp->if_input)(ifp, ptr_encode(m, af_to_bits(pkt->p_af))); */
+		/* dump_stack(); */
+		(*ifp->if_input)(ifp, m);
 
 		wg_timers_event_data_received(peer);
 
@@ -1796,6 +1827,58 @@ error:
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		wg_packet_free(pkt);
 	}
+}
+
+static inline void xmit_err(struct ifnet *ifp, struct mbuf *m,
+			    struct wg_packet *pkt, sa_family_t af);
+static void
+wg_if_input(struct ifnet *ifp, struct mbuf *m)
+{
+	struct epoch_tracker et;
+	sa_family_t af, af0;
+	int ret;
+
+	dump_stack();
+	af0 = bits_to_af(ptr_flags(m));
+	m = ptr_decode(m);
+
+	if (af0 == 0) {
+		ret = determine_af_and_pullup(&m, &af);
+		if (ret) {
+			struct wg_softc *sc;
+
+			sc = ifp->if_softc;
+			DPRINTF(sc, "unable to determine AF: %d\n", ret);
+			m_freem(m);
+			return;
+		}
+	}
+	if (pr_ratelimit(-1))
+		printf("wg: dispatch af: %u af0: %u if_input: %p if_transmit: %p\n",
+		       af, af0, ifp->if_input, ifp->if_transmit);
+	printf("ifnam: %s dnam: %s if_input: %p wg_transmit: %p\n",
+	       ifp->if_xname, ifp->if_dname, if_input, wg_transmit);
+
+	if (af0)
+		af = af0;
+	m->m_pkthdr.rcvif = ifp;
+
+	NET_EPOCH_ENTER(et);
+	BPF_MTAP2_AF(ifp, m, af);
+
+	CURVNET_SET(ifp->if_vnet);
+	M_SETFIB(m, ifp->if_fib);
+	if (af == AF_INET) {
+		static int count;
+		if (pr_ratelimit(-1)) {
+			printf("wg: netisr dispatch: %d\n", count++);
+			mb_hexdump(m);
+		}
+		netisr_dispatch(NETISR_IP, m);
+	} else if (af == AF_INET6)
+		netisr_dispatch(NETISR_IPV6, m);
+	CURVNET_RESTORE();
+	NET_EPOCH_EXIT(et);
 }
 
 static struct wg_packet *
@@ -2147,6 +2230,7 @@ wg_xmit(struct ifnet *ifp, struct mbuf *m, sa_family_t af, uint32_t mtu)
 	int			 rc = 0;
 	sa_family_t		 peer_af;
 
+	dump_stack();
 	/* Work around lifetime issue in the ipv6 mld code. */
 	if (__predict_false((ifp->if_flags & IFF_DYING) || !sc)) {
 		rc = ENXIO;
@@ -2255,6 +2339,9 @@ wg_output(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *dst, struct 
 	uint32_t af, mtu;
 	int ret;
 	struct mbuf *defragged;
+
+	dump_stack();
+	return (*ifp->if_transmit)(ifp, m);
 
 	if (dst->sa_family == AF_UNSPEC)
 		memcpy(&af, dst->sa_data, sizeof(af));
@@ -2839,6 +2926,7 @@ wg_clone_create(struct if_clone *ifc, char *name, size_t len,
 	ifp->if_init = wg_init;
 	ifp->if_reassign = wg_reassign;
 	ifp->if_qflush = wg_qflush;
+	ifp->if_input = wg_if_input;
 	ifp->if_transmit = wg_transmit;
 	ifp->if_output = wg_output;
 	ifp->if_ioctl = wg_ioctl;
@@ -3123,3 +3211,6 @@ static moduledata_t wg_moduledata = {
 DECLARE_MODULE(wg, wg_moduledata, SI_SUB_PSEUDO, SI_ORDER_ANY);
 MODULE_VERSION(wg, WIREGUARD_VERSION);
 MODULE_DEPEND(wg, crypto, 1, 1, 1);
+#ifdef DEV_NETMAP
+MODULE_DEPEND(wg, netmap, 1, 1, 1);
+#endif /* DEV_NETMAP */
