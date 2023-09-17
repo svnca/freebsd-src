@@ -1776,6 +1776,28 @@ bits_to_af(unsigned long af)
 	return 0;
 }
 
+static int
+wg_nm_prepend_eth_hdr(struct ifnet *ifp, int isr, struct mbuf *m)
+{
+	struct netmap_adapter *na = NA(ifp);
+	struct ether_header *eh;
+
+	if (!nm_netmap_on(na))
+		return 1;
+
+	M_PREPEND(m, ETHER_HDR_LEN, M_NOWAIT);
+	if (m == NULL) {
+		nm_prlim(5, "failed to prepend fake ethernet header, skipping");
+		return 0;
+	}
+	eh = mtod(m, struct ether_header *);
+	eh->ether_type = htons(isr == AF_INET6 ? ETHERTYPE_IPV6 : ETHERTYPE_IP);
+	memcpy(eh->ether_shost, "\x02\x02\x02\x02\x02\x02", ETHER_ADDR_LEN);
+	memcpy(eh->ether_dhost, "\x06\x06\x06\x06\x06\x06", ETHER_ADDR_LEN);
+	m->m_pkthdr.rcvif = ifp;
+	return 1; /* stolen */
+}
+
 static void
 wg_deliver_in(struct wg_peer *peer)
 {
@@ -1814,6 +1836,8 @@ wg_deliver_in(struct wg_peer *peer)
 		/* wg_if_input(ifp, ptr_encode(m, af_to_bits(pkt->p_af))); */
 		/* (*ifp->if_input)(ifp, ptr_encode(m, af_to_bits(pkt->p_af))); */
 		/* dump_stack(); */
+		if (wg_nm_prepend_eth_hdr(ifp, pkt->p_af, m) == 0)
+			goto done;
 		(*ifp->if_input)(ifp, m);
 
 		wg_timers_event_data_received(peer);
@@ -1834,11 +1858,16 @@ static inline void xmit_err(struct ifnet *ifp, struct mbuf *m,
 static void
 wg_if_input(struct ifnet *ifp, struct mbuf *m)
 {
+	struct netmap_adapter *na = NA(ifp);
 	struct epoch_tracker et;
 	sa_family_t af, af0;
 	int ret;
 
 	dump_stack();
+
+	if (nm_netmap_on(na))
+		m_adj(m, ETHER_HDR_LEN);
+
 	af0 = bits_to_af(ptr_flags(m));
 	m = ptr_decode(m);
 
@@ -1861,6 +1890,7 @@ wg_if_input(struct ifnet *ifp, struct mbuf *m)
 
 	if (af0)
 		af = af0;
+
 	m->m_pkthdr.rcvif = ifp;
 
 	NET_EPOCH_ENTER(et);
@@ -2311,9 +2341,13 @@ determine_af_and_pullup(struct mbuf **m, sa_family_t *af)
 static int
 wg_transmit(struct ifnet *ifp, struct mbuf *m)
 {
-	sa_family_t af;
+	sa_family_t af = 0;
 	int ret;
 	struct mbuf *defragged;
+	struct netmap_adapter *na = NA(ifp);
+
+	if (nm_netmap_on(na))
+		m_adj(m, ETHER_HDR_LEN);
 
 	defragged = m_defrag(m, M_NOWAIT);
 	if (defragged)
@@ -2324,10 +2358,12 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 		return (ENOBUFS);
 	}
 
-	ret = determine_af_and_pullup(&m, &af);
-	if (ret) {
-		xmit_err(ifp, m, NULL, AF_UNSPEC);
-		return (ret);
+	if (!af) {
+		ret = determine_af_and_pullup(&m, &af);
+		if (ret) {
+			xmit_err(ifp, m, NULL, AF_UNSPEC);
+			return (ret);
+		}
 	}
 	return (wg_xmit(ifp, m, af, ifp->if_mtu));
 }
@@ -2340,9 +2376,6 @@ wg_output(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *dst, struct 
 	int ret;
 	struct mbuf *defragged;
 
-	dump_stack();
-	return (*ifp->if_transmit)(ifp, m);
-
 	if (dst->sa_family == AF_UNSPEC)
 		memcpy(&af, dst->sa_data, sizeof(af));
 	else
@@ -2351,6 +2384,11 @@ wg_output(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *dst, struct 
 		xmit_err(ifp, m, NULL, af);
 		return (EAFNOSUPPORT);
 	}
+
+	dump_stack();
+	if (wg_nm_prepend_eth_hdr(ifp, af, m) == 0)
+		return (EAFNOSUPPORT);
+	return (*ifp->if_transmit)(ifp, m);
 
 	defragged = m_defrag(m, M_NOWAIT);
 	if (defragged)
