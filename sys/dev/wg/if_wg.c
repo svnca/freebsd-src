@@ -366,6 +366,7 @@ static int wg_clone_create(struct if_clone *ifc, char *name, size_t len,
 static void wg_qflush(struct ifnet *);
 static inline int determine_af_and_pullup(struct mbuf **m, sa_family_t *af);
 static int wg_xmit(struct ifnet *, struct mbuf *, sa_family_t, uint32_t);
+static void wg_if_input(struct ifnet *ifp, struct mbuf *m);
 static int wg_transmit(struct ifnet *, struct mbuf *);
 static int wg_output(struct ifnet *, struct mbuf *, const struct sockaddr *, struct route *);
 static int wg_clone_destroy(struct if_clone *ifc, struct ifnet *ifp,
@@ -1684,7 +1685,6 @@ wg_deliver_in(struct wg_peer *peer)
 	struct ifnet		*ifp = sc->sc_ifp;
 	struct wg_packet	*pkt;
 	struct mbuf		*m;
-	struct epoch_tracker	 et;
 
 	while ((pkt = wg_queue_dequeue_serial(&peer->p_decrypt_serial)) != NULL) {
 		if (pkt->p_state != WG_PACKET_CRYPTED)
@@ -1713,19 +1713,7 @@ wg_deliver_in(struct wg_peer *peer)
 		MPASS(pkt->p_af == AF_INET || pkt->p_af == AF_INET6);
 		pkt->p_mbuf = NULL;
 
-		m->m_pkthdr.rcvif = ifp;
-
-		NET_EPOCH_ENTER(et);
-		BPF_MTAP2_AF(ifp, m, pkt->p_af);
-
-		CURVNET_SET(ifp->if_vnet);
-		M_SETFIB(m, ifp->if_fib);
-		if (pkt->p_af == AF_INET)
-			netisr_dispatch(NETISR_IP, m);
-		if (pkt->p_af == AF_INET6)
-			netisr_dispatch(NETISR_IPV6, m);
-		CURVNET_RESTORE();
-		NET_EPOCH_EXIT(et);
+		(*ifp->if_input)(ifp, m);
 
 		wg_timers_event_data_received(peer);
 
@@ -1738,6 +1726,40 @@ error:
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		wg_packet_free(pkt);
 	}
+}
+
+static inline void xmit_err(struct ifnet *ifp, struct mbuf *m,
+			    struct wg_packet *pkt, sa_family_t af);
+static void
+wg_if_input(struct ifnet *ifp, struct mbuf *m)
+{
+	struct epoch_tracker et;
+	sa_family_t af;
+	int ret;
+
+	ret = determine_af_and_pullup(&m, &af);
+	if (ret) {
+		struct wg_softc *sc;
+
+		sc = ifp->if_softc;
+		DPRINTF(sc, "unable to determine AF: %d\n", ret);
+		m_freem(m);
+		return;
+	}
+
+	m->m_pkthdr.rcvif = ifp;
+
+	NET_EPOCH_ENTER(et);
+	BPF_MTAP2_AF(ifp, m, af);
+
+	CURVNET_SET(ifp->if_vnet);
+	M_SETFIB(m, ifp->if_fib);
+	if (af == AF_INET)
+		netisr_dispatch(NETISR_IP, m);
+	else if (af == AF_INET6)
+		netisr_dispatch(NETISR_IPV6, m);
+	CURVNET_RESTORE();
+	NET_EPOCH_EXIT(et);
 }
 
 static struct wg_packet *
@@ -2193,40 +2215,7 @@ wg_transmit(struct ifnet *ifp, struct mbuf *m)
 static int
 wg_output(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *dst, struct route *ro)
 {
-	sa_family_t parsed_af;
-	uint32_t af, mtu;
-	int ret;
-	struct mbuf *defragged;
-
-	if (dst->sa_family == AF_UNSPEC)
-		memcpy(&af, dst->sa_data, sizeof(af));
-	else
-		af = dst->sa_family;
-	if (af == AF_UNSPEC) {
-		xmit_err(ifp, m, NULL, af);
-		return (EAFNOSUPPORT);
-	}
-
-	defragged = m_defrag(m, M_NOWAIT);
-	if (defragged)
-		m = defragged;
-	m = m_unshare(m, M_NOWAIT);
-	if (!m) {
-		xmit_err(ifp, m, NULL, AF_UNSPEC);
-		return (ENOBUFS);
-	}
-
-	ret = determine_af_and_pullup(&m, &parsed_af);
-	if (ret) {
-		xmit_err(ifp, m, NULL, AF_UNSPEC);
-		return (ret);
-	}
-	if (parsed_af != af) {
-		xmit_err(ifp, m, NULL, AF_UNSPEC);
-		return (EAFNOSUPPORT);
-	}
-	mtu = (ro != NULL && ro->ro_mtu > 0) ? ro->ro_mtu : ifp->if_mtu;
-	return (wg_xmit(ifp, m, parsed_af, mtu));
+	return (*ifp->if_transmit)(ifp, m);
 }
 
 static int
@@ -2781,6 +2770,7 @@ wg_clone_create(struct if_clone *ifc, char *name, size_t len,
 	ifp->if_init = wg_init;
 	ifp->if_reassign = wg_reassign;
 	ifp->if_qflush = wg_qflush;
+	ifp->if_input = wg_if_input;
 	ifp->if_transmit = wg_transmit;
 	ifp->if_output = wg_output;
 	ifp->if_ioctl = wg_ioctl;
