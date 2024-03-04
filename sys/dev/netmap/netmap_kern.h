@@ -2051,6 +2051,7 @@ struct nm_os_gen_arg {
 	void *m;	/* os-specific mbuf-like object */
 	void *head, *tail; /* tailq, if the OS-specific routine needs to build one */
 	void *addr;	/* payload of current packet */
+	struct m_tag *tag;
 	u_int len;	/* packet length */
 	u_int ring_nr;	/* transmit ring index */
 	u_int qevent;   /* in txqdisc mode, place an event on this mbuf */
@@ -2345,6 +2346,42 @@ nm_os_mbuf_reinit(struct mbuf *m)
 	m_init(m, M_NOWAIT, MT_DATA, M_PKTHDR);
 	m_extadd(m, buf, MCLBYTES, nm_generic_mbuf_dtor, NULL, NULL, 0,
 	    EXT_NET_DRV);
+}
+
+static inline struct m_tag *
+nm_unlink_tagchain(struct mbuf *m)
+{
+	struct m_tag *tag = NULL;
+
+	if ((m->m_flags & M_PKTHDR) != 0) {
+		tag = m_tag_first(m);
+		m_tag_init(m);
+	}
+	return (tag);
+}
+
+static inline void *
+nm_tag_save(void *p, struct mbuf *m)
+{
+	struct m_tag **tagp;
+
+	tagp = p;
+	*tagp = nm_unlink_tagchain(m);
+	p = tagp + 1;
+	return (p);
+}
+
+static inline void *
+nm_tag_restore(void *p, struct mbuf *m, struct m_tag **tagp)
+{
+	struct m_tag **tag;
+
+	tag = p;
+	if (tagp)
+		*tagp = *tag;
+	if (m)
+		SLIST_FIRST(&m->m_pkthdr.tags) = *tag;
+	return (tag + 1);
 }
 
 #endif /* __FreeBSD__ */

@@ -1198,6 +1198,7 @@ netmap_grab_packets(struct netmap_kring *kring, struct mbq *q, int force)
 	for (n = kring->nr_hwcur; n != head; n = nm_next(n, lim)) {
 		struct mbuf *m;
 		struct netmap_slot *slot = &kring->ring->slot[n];
+		void *addr, *tagp;
 
 		if ((slot->flags & NS_FORWARD) == 0 && !force)
 			continue;
@@ -1206,11 +1207,13 @@ netmap_grab_packets(struct netmap_kring *kring, struct mbq *q, int force)
 			continue;
 		}
 		slot->flags &= ~NS_FORWARD; // XXX needed ?
+		tagp = NMB(na, slot);
+		addr = nm_tag_restore(tagp, NULL, NULL);
 		/* XXX TODO: adapt to the case of a multisegment packet */
-		m = m_devget(NMB(na, slot), slot->len, 0, na->ifp, NULL);
-
+		m = m_devget(addr, slot->len, 0, na->ifp, NULL);
 		if (m == NULL)
 			break;
+		nm_tag_restore(tagp, m, NULL);
 		mbq_enqueue(q, m);
 	}
 }
@@ -1362,8 +1365,11 @@ netmap_rxsync_from_host(struct netmap_kring *kring, int flags)
 		while ( nm_i != stop_i && (m = mbq_dequeue(q)) != NULL ) {
 			int len = MBUF_LEN(m);
 			struct netmap_slot *slot = &ring->slot[nm_i];
+			void *nmaddr;
 
-			m_copydata(m, 0, len, NMB(na, slot));
+			nmaddr = NMB(na, slot);
+			nmaddr = nm_tag_save(nmaddr, m);
+			m_copydata(m, 0, len, nmaddr);
 			nm_prdis("nm %d len %d", nm_i, len);
 			if (netmap_debug & NM_DEBUG_HOST)
 				nm_prinf("%s", nm_dump_buf(NMB(na, slot),len, 128, NULL));

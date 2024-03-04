@@ -749,7 +749,7 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 			}
 
 			a.m = m;
-			a.addr = addr;
+			a.addr = nm_tag_restore(addr, m, &a.tag);
 			a.len = len;
 			a.qevent = (nm_i == event);
 			/* When not in txqdisc mode, we should ask
@@ -1028,6 +1028,7 @@ generic_netmap_rxsync(struct netmap_kring *kring, int flags)
 				return netmap_ring_reinit(kring);
 			}
 
+			nmaddr = nm_tag_save(nmaddr, m);
 			copy = ring->slot[nm_i].len;
 			m_copydata(m, ofs, copy, nmaddr);
 			ofs += copy;
